@@ -58,8 +58,7 @@ jobs:
         env:
           POST_ID: ${{ inputs.post_id }}
           CONFIRMATION: ${{ inputs.confirmation }}
-          INSTAGRAM_USER_ID: ${{ vars.INSTAGRAM_USER_ID }}
-          INSTAGRAM_ACCESS_TOKEN: ${{ secrets.INSTAGRAM_ACCESS_TOKEN }}
-          META_GRAPH_VERSION: ${{ vars.META_GRAPH_VERSION || 'v26.0' }}
+          BUFFER_API_KEY: ${{ secrets.BUFFER_API_KEY }}
+          BUFFER_CHANNEL_ID: ${{ vars.BUFFER_CHANNEL_ID }}
           PUBLIC_IMAGE_BASE_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/posts/images
         run: npm run publish
