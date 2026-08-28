@@ -1,5 +1,7 @@
 import { loadQueue } from "./queue.mjs";
 
+const BUFFER_API_URL = "https://api.buffer.com";
+
 function required(name) {
   const value = process.env[name]?.trim();
   if (!value) throw new Error(`Missing required environment value: ${name}`);
@@ -12,60 +14,97 @@ function cleanBaseUrl(value) {
   return url.href.replace(/\/$/, "");
 }
 
-async function metaRequest(baseUrl, pathname, { method = "GET", params = {} } = {}) {
-  const accessToken = required("INSTAGRAM_ACCESS_TOKEN");
-  const url = new URL(`${baseUrl}/${pathname.replace(/^\//, "")}`);
-  const values = new URLSearchParams({ ...params, access_token: accessToken });
-  const options = method === "GET"
-    ? { method, headers: { Accept: "application/json" } }
-    : {
-        method,
-        headers: {
-          Accept: "application/json",
-          "Content-Type": "application/x-www-form-urlencoded"
-        },
-        body: values
-      };
+async function bufferRequest(query, variables = {}) {
+  const response = await fetch(BUFFER_API_URL, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      Authorization: `Bearer ${required("BUFFER_API_KEY")}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ query, variables })
+  });
 
-  if (method === "GET") url.search = values.toString();
-  const response = await fetch(url, options);
   const payload = await response.json().catch(() => ({}));
-  if (!response.ok || payload.error) {
-    const message = payload.error?.message || `HTTP ${response.status}`;
-    const code = payload.error?.code ? ` (Meta code ${payload.error.code})` : "";
-    throw new Error(`${message}${code}`);
+  if (!response.ok) {
+    throw new Error(payload.message || `Buffer returned HTTP ${response.status}.`);
   }
-  return payload;
+  if (payload.errors?.length) {
+    throw new Error(payload.errors.map((error) => error.message).join("; "));
+  }
+  return payload.data;
 }
 
 async function assertPublicImage(imageUrl) {
   const response = await fetch(imageUrl, { method: "HEAD", redirect: "follow" });
-  if (!response.ok) throw new Error(`Instagram cannot fetch the image URL (HTTP ${response.status}).`);
+  if (!response.ok) throw new Error(`Buffer cannot fetch the image URL (HTTP ${response.status}).`);
   const contentType = response.headers.get("content-type") || "";
   if (!contentType.toLowerCase().includes("image/jpeg")) {
     throw new Error(`Image URL must return image/jpeg; received ${contentType || "no content type"}.`);
   }
 }
 
-async function findDuplicate(baseUrl, userId, caption) {
-  const media = await metaRequest(baseUrl, `${userId}/media`, {
-    params: { fields: "id,caption,timestamp,permalink", limit: "50" }
-  });
-  return (media.data || []).find((item) => (item.caption || "").trim() === caption.trim());
+async function getInstagramChannel() {
+  const account = await bufferRequest(`
+    query SpyglassOrganizations {
+      account {
+        organizations { id name }
+      }
+    }
+  `);
+  const organizations = account?.account?.organizations || [];
+  if (!organizations.length) throw new Error("No Buffer organization was found for this API key.");
+
+  const instagramChannels = [];
+  for (const organization of organizations) {
+    const data = await bufferRequest(`
+      query SpyglassChannels {
+        channels(input: { organizationId: ${JSON.stringify(organization.id)} }) {
+          id
+          name
+          displayName
+          service
+        }
+      }
+    `);
+    for (const channel of data?.channels || []) {
+      if (String(channel.service).toLowerCase() === "instagram") {
+        instagramChannels.push({ ...channel, organizationId: organization.id });
+      }
+    }
+  }
+
+  const requestedId = process.env.BUFFER_CHANNEL_ID?.trim();
+  if (requestedId) {
+    const match = instagramChannels.find((channel) => channel.id === requestedId);
+    if (!match) throw new Error("BUFFER_CHANNEL_ID is not a connected Instagram channel.");
+    return match;
+  }
+
+  if (instagramChannels.length === 1) return instagramChannels[0];
+  if (!instagramChannels.length) {
+    throw new Error("No Instagram channel is connected to this Buffer account.");
+  }
+  throw new Error("More than one Instagram channel is connected. Add BUFFER_CHANNEL_ID as a GitHub repository variable.");
 }
 
-async function waitForContainer(baseUrl, containerId) {
-  for (let attempt = 1; attempt <= 30; attempt += 1) {
-    const status = await metaRequest(baseUrl, containerId, {
-      params: { fields: "status_code,status" }
-    });
-    if (status.status_code === "FINISHED") return;
-    if (["ERROR", "EXPIRED"].includes(status.status_code)) {
-      throw new Error(`Instagram media processing ended with ${status.status_code}: ${status.status || "no details"}`);
+async function findDuplicate(channel, caption) {
+  const data = await bufferRequest(`
+    query SpyglassRecentPosts {
+      posts(
+        first: 50
+        input: {
+          organizationId: ${JSON.stringify(channel.organizationId)}
+          filter: { status: [sent, scheduled], channelIds: [${JSON.stringify(channel.id)}] }
+        }
+      ) {
+        edges { node { id text status } }
+      }
     }
-    await new Promise((resolve) => setTimeout(resolve, Math.min(2000 + attempt * 250, 5000)));
-  }
-  throw new Error("Instagram did not finish processing the image within the allowed time.");
+  `);
+  return (data?.posts?.edges || [])
+    .map((edge) => edge.node)
+    .find((item) => (item.text || "").trim() === caption.trim());
 }
 
 async function main() {
@@ -74,10 +113,6 @@ async function main() {
   }
 
   const postId = required("POST_ID").padStart(2, "0");
-  const userId = required("INSTAGRAM_USER_ID");
-  const graphVersion = (process.env.META_GRAPH_VERSION || "v26.0").trim();
-  if (!/^v\d+\.\d+$/.test(graphVersion)) throw new Error(`Invalid META_GRAPH_VERSION: ${graphVersion}`);
-  const baseUrl = `https://graph.instagram.com/${graphVersion}`;
   const imageBaseUrl = cleanBaseUrl(required("PUBLIC_IMAGE_BASE_URL"));
   const queue = await loadQueue();
   const post = queue.find((item) => item.id === postId);
@@ -87,26 +122,33 @@ async function main() {
   console.log(`Preparing post ${post.id}: ${post.title}`);
   await assertPublicImage(imageUrl);
 
-  const duplicate = await findDuplicate(baseUrl, userId, post.caption);
-  if (duplicate) {
-    throw new Error(`This exact caption is already published: ${duplicate.permalink || duplicate.id}`);
-  }
+  const channel = await getInstagramChannel();
+  const duplicate = await findDuplicate(channel, post.caption);
+  if (duplicate) throw new Error(`This exact caption already exists in Buffer as post ${duplicate.id}.`);
 
-  const container = await metaRequest(baseUrl, `${userId}/media`, {
-    method: "POST",
-    params: { image_url: imageUrl, caption: post.caption }
+  const data = await bufferRequest(`
+    mutation PublishSpyglassPost($input: CreatePostInput!) {
+      createPost(input: $input) {
+        ... on PostActionSuccess {
+          post { id status }
+        }
+        ... on MutationError { message }
+      }
+    }
+  `, {
+    input: {
+      text: post.caption,
+      channelId: channel.id,
+      schedulingType: "automatic",
+      mode: "shareNow",
+      assets: [{ image: { url: imageUrl } }],
+      metadata: { instagram: { type: "post", shouldShareToFeed: true } }
+    }
   });
-  if (!container.id) throw new Error("Instagram did not return a media container id.");
 
-  await waitForContainer(baseUrl, container.id);
-  const published = await metaRequest(baseUrl, `${userId}/media_publish`, {
-    method: "POST",
-    params: { creation_id: container.id }
-  });
-  if (!published.id) throw new Error("Instagram did not return a published media id.");
-
-  const result = await metaRequest(baseUrl, published.id, { params: { fields: "permalink" } });
-  console.log(`Published post ${post.id}: ${result.permalink || published.id}`);
+  const result = data?.createPost;
+  if (!result?.post?.id) throw new Error(result?.message || "Buffer did not return a post id.");
+  console.log(`Submitted post ${post.id} to Buffer: ${result.post.id} (${result.post.status || "processing"})`);
 }
 
 main().catch((error) => {
