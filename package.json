@@ -1,0 +1,14 @@
+{
+  "name": "spyglass-instagram-publisher",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "validate": "node scripts/validate-queue.mjs",
+    "publish": "node scripts/publish-instagram.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
