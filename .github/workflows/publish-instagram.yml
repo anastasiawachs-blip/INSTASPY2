@@ -1,0 +1,65 @@
+name: Publish one Instagram post
+
+on:
+  workflow_dispatch:
+    inputs:
+      post_id:
+        description: Choose exactly one queued post
+        required: true
+        type: choice
+        options:
+          - "02"
+          - "03"
+          - "04"
+          - "05"
+          - "06"
+          - "07"
+          - "08"
+          - "09"
+          - "10"
+          - "11"
+          - "12"
+          - "13"
+          - "14"
+          - "15"
+          - "16"
+          - "17"
+          - "18"
+          - "19"
+      confirmation:
+        description: Type PUBLISH to confirm this one post
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: spyglass-instagram-publisher
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the post queue
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Validate the complete queue
+        run: npm run validate
+
+      - name: Publish the selected post
+        env:
+          POST_ID: ${{ inputs.post_id }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+          INSTAGRAM_USER_ID: ${{ vars.INSTAGRAM_USER_ID }}
+          INSTAGRAM_ACCESS_TOKEN: ${{ secrets.INSTAGRAM_ACCESS_TOKEN }}
+          META_GRAPH_VERSION: ${{ vars.META_GRAPH_VERSION || 'v26.0' }}
+          PUBLIC_IMAGE_BASE_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/posts/images
+        run: npm run publish
